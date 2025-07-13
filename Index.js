@@ -1,509 +1,282 @@
+// admin-api.js
 require('dotenv').config();
 const express = require('express');
-const bcrypt = require('bcrypt');
+const router = express.Router();
 const jwt = require('jsonwebtoken');
-const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Enhanced security middleware
-const helmet = require('helmet');
-const mongoSanitize = require('express-mongo-sanitize');
-const hpp = require('hpp');
-
-// Apply security middleware
-app.use(helmet());
-app.use(mongoSanitize());
-app.use(hpp());
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
-  credentials: true
-}));
-app.use(express.json({ limit: '10kb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Enhanced rate limiting
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // Reduced from 20 to 10
-  message: 'Too many requests from this IP, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
-// Bot state management
-const activeBots = new Map();
-
-// Enhanced mock database with PBKDF2 support
+// Mock database (replace with real DB in production)
 let users = [
   {
     id: 1,
     username: "Shadow",
     email: "admin@oblivion.com",
-    password: bcrypt.hashSync("Shadow", 12),
-    salt: crypto.randomBytes(16).toString('hex'),
+    password: "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW", // "Shadow"
+    salt: "randomSalt123",
     iterations: 100000,
     role: "admin",
-    lastPasswordChange: new Date(),
-    failedLoginAttempts: 0,
-    accountLockedUntil: null
+    joinedAt: new Date(),
+    lastActive: new Date(),
+    banned: false,
+    botsDeployed: 5
   }
 ];
 
-// Password reset tokens
-const resetTokens = new Map();
-
-// Email transporter
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  },
-  tls: {
-    rejectUnauthorized: true
+let botDeployments = [
+  {
+    id: "bot-001",
+    userId: 1,
+    username: "Shadow",
+    phoneNumber: "+1234567890",
+    status: "active",
+    startedAt: new Date(Date.now() - 3600000),
+    lastActive: new Date(),
+    commandsExecuted: 42,
+    ipAddress: "192.168.1.100"
   }
-});
+];
 
-// Security helper functions
-const generateToken = () => crypto.randomBytes(32).toString('hex');
-const generatePairingCode = () => crypto.randomInt(100000, 999999);
-const generateNonce = () => crypto.randomBytes(16).toString('hex');
-
-// PBKDF2 password hashing
-const hashPassword = async (password, salt, iterations) => {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(password),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveBits']
-  );
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: new TextEncoder().encode(salt),
-      iterations,
-      hash: 'SHA-256'
-    },
-    key,
-    256
-  );
-  return Buffer.from(derivedBits).toString('hex');
+let userActivity = [];
+let apiUsageData = {
+  totalRequests: 0,
+  endpoints: []
 };
 
-// Enhanced Bot Control Routes (unchanged from your original)
-app.post('/api/start', authLimiter, async (req, res) => {
-  /* ... unchanged ... */
+// Admin rate limiting
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // limit each IP to 30 requests per minute
+  message: "Too many requests from this IP, please try again later"
 });
 
-app.post('/api/stop', authLimiter, async (req, res) => {
-  /* ... unchanged ... */
-});
-
-app.post('/api/add', authLimiter, async (req, res) => {
-  /* ... unchanged ... */
-});
-
-// Enhanced Auth Routes
-app.post('/api/login', authLimiter, async (req, res) => {
-  const { identifier, password: hashedPasswordHex, challenge } = req.body;
-  
-  // Validate challenge exists
-  if (!challenge) {
-    return res.status(400).json({ error: "Authentication challenge missing" });
-  }
-
-  // Special admin login (now uses challenge-response)
-  if (identifier.toLowerCase() === "shadow") {
-    try {
-      const adminPassword = "Shadow";
-      const challengeResponse = await hashPassword(adminPassword + challenge, '', 1);
-      
-      if (hashedPasswordHex === challengeResponse) {
-        const token = jwt.sign(
-          { userId: 1, role: "admin", nonce: generateNonce() },
-          process.env.ADMIN_SECRET || 'ADMIN_SECRET_KEY',
-          { expiresIn: '1h' }
-        );
-        
-        // Set secure HTTP-only cookie
-        res.cookie('oblivionToken', token, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'strict',
-          maxAge: 3600000 // 1 hour
-        });
-        
-        return res.json({ 
-          success: true,
-          role: "admin",
-          nonce: generateNonce() // For client-side redirect validation
-        });
-      }
-    } catch (error) {
-      console.error("Admin login error:", error);
-      return res.status(500).json({ error: "Authentication error" });
-    }
-  }
-
-  // Find user with account lock check
-  const user = users.find(u => 
-    u.email === identifier || u.username === identifier
-  );
-  
-  if (!user) {
-    return res.status(401).json({ error: "Invalid credentials" });
-  }
-
-  // Check if account is locked
-  if (user.accountLockedUntil && user.accountLockedUntil > Date.now()) {
-    const remainingTime = Math.ceil((user.accountLockedUntil - Date.now()) / 60000);
-    return res.status(403).json({ 
-      error: `Account locked. Try again in ${remainingTime} minutes.` 
-    });
-  }
-
-  try {
-    // Verify the hashed password
-    const computedHash = await hashPassword(
-      user.password + challenge, 
-      user.salt, 
-      user.iterations
-    );
-    
-    if (hashedPasswordHex !== computedHash) {
-      // Increment failed attempts
-      user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
-      
-      // Lock account after 5 failed attempts
-      if (user.failedLoginAttempts >= 5) {
-        user.accountLockedUntil = Date.now() + 5 * 60 * 1000; // 5 minutes
-        return res.status(403).json({ 
-          error: "Account locked due to too many failed attempts. Try again in 5 minutes." 
-        });
-      }
-      
-      return res.status(401).json({ 
-        error: "Invalid credentials",
-        remainingAttempts: 5 - user.failedLoginAttempts
-      });
-    }
-    
-    // Reset failed attempts on successful login
-    user.failedLoginAttempts = 0;
-    user.accountLockedUntil = null;
-    
-    const token = jwt.sign(
-      { 
-        userId: user.id, 
-        role: user.role,
-        nonce: generateNonce()
-      },
-      process.env.JWT_SECRET || 'USER_SECRET_KEY',
-      { expiresIn: '1h' }
-    );
-    
-    // Set secure HTTP-only cookie
-    res.cookie('oblivionToken', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 3600000 // 1 hour
-    });
-    
-    res.json({ 
-      success: true,
-      role: user.role,
-      nonce: generateNonce() // For client-side redirect validation
-    });
-    
-  } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ error: "Authentication error" });
-  }
-});
-
-app.post('/api/signup', authLimiter, async (req, res) => {
-  const { username, email, password: hashedPasswordHex, salt, iterations } = req.body;
-  
-  if (!username || !email || !hashedPasswordHex || !salt || !iterations) {
-    return res.status(400).json({ error: "All fields are required" });
-  }
-  
-  // Validate username format
-  if (!/^[a-zA-Z0-9_]{4,20}$/.test(username)) {
-    return res.status(400).json({ 
-      field: "username", 
-      error: "Only letters, numbers and underscores (4-20 characters)" 
-    });
-  }
-  
-  // Validate email format
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ 
-      field: "email", 
-      error: "Invalid email format" 
-    });
-  }
-  
-  // Check for existing user
-  if (users.some(u => u.email === email)) {
-    return res.status(400).json({ field: "email", error: "Email already in use" });
-  }
-  
-  if (users.some(u => u.username === username)) {
-    return res.status(400).json({ field: "username", error: "Username taken" });
-  }
-  
-  // Create new user with enhanced security
-  const newUser = {
-    id: users.length + 1,
-    username,
-    email,
-    password: hashedPasswordHex, // Already hashed client-side
-    salt,
-    iterations,
-    role: "user",
-    createdAt: new Date(),
-    lastPasswordChange: new Date(),
-    failedLoginAttempts: 0,
-    accountLockedUntil: null
-  };
-  
-  users.push(newUser);
-  
-  const token = jwt.sign(
-    { 
-      userId: newUser.id, 
-      role: newUser.role,
-      nonce: generateNonce()
-    },
-    process.env.JWT_SECRET || 'USER_SECRET_KEY',
-    { expiresIn: '1h' }
-  );
-  
-  // Set secure HTTP-only cookie
-  res.cookie('oblivionToken', token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 3600000 // 1 hour
-  });
-  
-  res.status(201).json({ 
-    success: true,
-    nonce: generateNonce() // For client-side redirect validation
-  });
-});
-
-// Enhanced Password Reset Routes
-app.post('/api/password/reset-request', authLimiter, async (req, res) => {
-  const { identifier } = req.body;
-  
-  if (!identifier) {
-    return res.status(400).json({ error: "Identifier is required" });
-  }
-  
-  // Rate limit reset requests per identifier
-  const resetAttempts = req.rateLimit.current;
-  if (resetAttempts > 3) {
-    return res.status(429).json({ 
-      error: "Too many reset requests. Please wait before trying again." 
-    });
-  }
-  
-  const user = users.find(u => 
-    u.email === identifier || u.username === identifier
-  );
-  
-  if (!user) {
-    // Don't reveal whether identifier exists
-    return res.json({ 
-      success: true,
-      message: "If an account exists, a reset link has been sent" 
-    });
-  }
-  
-  // Generate and store token
-  const token = generateToken();
-  resetTokens.set(token, {
-    userId: user.id,
-    expires: Date.now() + 3600000, // 1 hour
-    used: false
-  });
-  
-  // Create secure reset link
-  const resetLink = `${process.env.BASE_URL || 'http://localhost:3000'}/reset-password?token=${token}&nonce=${generateNonce()}`;
-  
-  try {
-    await transporter.sendMail({
-      from: `"Oblivion Security" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: 'Password Reset Request',
-      html: `
-        <p>You requested a password reset for your Oblivion account.</p>
-        <p>Click <a href="${resetLink}">here</a> to reset your password.</p>
-        <p>This link will expire in 1 hour.</p>
-        <p>If you didn't request this, please ignore this email.</p>
-      `,
-      text: `Password reset link: ${resetLink}`
-    });
-  } catch (err) {
-    console.error("Email error:", err);
-    return res.status(500).json({ error: "Failed to send reset email" });
-  }
-  
-  res.json({ 
-    success: true,
-    message: "If an account exists, a reset link has been sent" 
-  });
-});
-
-app.post('/api/password/reset', authLimiter, async (req, res) => {
-  const { token, newPassword: hashedPasswordHex, salt, iterations } = req.body;
-  
-  if (!token || !hashedPasswordHex || !salt || !iterations) {
-    return res.status(400).json({ error: "All fields are required" });
-  }
-  
-  const resetData = resetTokens.get(token);
-  
-  if (!resetData || resetData.expires < Date.now() || resetData.used) {
-    return res.status(400).json({ error: "Invalid or expired token" });
-  }
-  
-  const user = users.find(u => u.id === resetData.userId);
-  if (!user) {
-    return res.status(400).json({ error: "User not found" });
-  }
-  
-  // Update user's password details
-  user.password = hashedPasswordHex;
-  user.salt = salt;
-  user.iterations = iterations;
-  user.lastPasswordChange = new Date();
-  
-  // Mark token as used
-  resetTokens.set(token, { ...resetData, used: true });
-  
-  res.json({ 
-    success: true,
-    message: "Password updated successfully" 
-  });
-});
-
-// Secure Dashboard Route
-app.get('/api/dashboard', authLimiter, async (req, res) => {
-  // Check for token in cookies (HTTP-only)
-  const token = req.cookies.oblivionToken;
+// Verify Admin Token Middleware
+function verifyAdminToken(req, res, next) {
+  const token = req.headers['authorization']?.split(' ')[1];
   
   if (!token) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(403).json({ error: "No token provided" });
   }
-  
-  try {
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'USER_SECRET_KEY');
-    
-    // Validate nonce if provided in query
-    if (req.query.nonce && req.query.nonce !== decoded.nonce) {
-      return res.status(401).json({ error: "Invalid session" });
+
+  jwt.verify(token, process.env.ADMIN_SECRET || 'ADMIN_SECRET_KEY', (err, decoded) => {
+    if (err || decoded.role !== 'admin') {
+      return res.status(401).json({ error: "Unauthorized" });
     }
     
-    // Get user data (without sensitive info)
-    const user = users.find(u => u.id === decoded.userId);
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-    
-    res.json({
-      success: true,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        createdAt: user.createdAt
-      }
-    });
-    
-  } catch (err) {
-    console.error("Dashboard auth error:", err);
-    
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: "Session expired" });
-    }
-    
-    res.status(401).json({ error: "Unauthorized" });
-  }
-});
-
-// Enhanced Admin Routes
-app.get('/api/admin/stats', authLimiter, async (req, res) => {
-  const token = req.cookies.oblivionToken;
-  
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-  
-  try {
-    const decoded = jwt.verify(token, process.env.ADMIN_SECRET || 'ADMIN_SECRET_KEY');
-    
-    if (decoded.role !== 'admin') {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-    
-    res.json({
-      success: true,
-      stats: {
-        totalUsers: users.length,
-        activeBots: activeBots.size,
-        activeSessions: 0, // Would track active sessions in production
-        systemStatus: "Operational",
-        uptime: process.uptime()
-      }
-    });
-  } catch (err) {
-    console.error("Admin auth error:", err);
-    res.status(401).json({ error: "Unauthorized" });
-  }
-});
-
-// Logout endpoint
-app.post('/api/logout', authLimiter, (req, res) => {
-  // Clear the HTTP-only cookie
-  res.clearCookie('oblivionToken', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict'
-  });
-  
-  res.json({ success: true, message: "Logged out successfully" });
-});
-
-// Start server with enhanced security
-const server = app.listen(PORT, () => {
-  console.log(`Oblivion API running on port ${PORT}`);
-  console.log(`Admin login: Username="Shadow", Password="Shadow"`);
-});
-
-// Security headers for HTTPS in production
-if (process.env.NODE_ENV === 'production') {
-  server.on('upgrade', (request, socket, head) => {
-    socket.on('error', console.error);
-  });
-  
-  process.on('uncaughtException', err => {
-    console.error('Uncaught Exception:', err);
-    process.exit(1);
-  });
-  
-  process.on('unhandledRejection', err => {
-    console.error('Unhandled Rejection:', err);
+    req.userId = decoded.userId;
+    next();
   });
 }
+
+// Generate mock data for dashboard
+function generateMockData() {
+  // Generate user activity
+  userActivity = [];
+  const actions = ["login", "logout", "bot_start", "bot_stop", "api_call", "password_change"];
+  const statuses = ["success", "failed", "pending"];
+  
+  for (let i = 0; i < 50; i++) {
+    const randomUser = users[Math.floor(Math.random() * users.length)];
+    const randomAction = actions[Math.floor(Math.random() * actions.length)];
+    const randomStatus = statuses[Math.floor(Math.random() * statuses.length)];
+    
+    userActivity.push({
+      id: `act-${i}`,
+      userId: randomUser.id,
+      username: randomUser.username,
+      action: randomAction,
+      status: randomStatus,
+      timestamp: new Date(Date.now() - Math.floor(Math.random() * 7 * 24 * 3600000)),
+      ipAddress: `192.168.1.${Math.floor(Math.random() * 255)}`,
+      details: `${randomAction} ${randomStatus}`
+    });
+  }
+
+  // Generate API usage data
+  apiUsageData = {
+    totalRequests: 12456,
+    labels: Array.from({length: 24}, (_, i) => `${i}:00`),
+    data: Array.from({length: 24}, () => Math.floor(Math.random() * 1000)),
+    endpoints: [
+      { path: "/api/login", requests24h: 3421, successRate: 98, avgResponseTime: 120, errors: 12 },
+      { path: "/api/bot/start", requests24h: 1567, successRate: 95, avgResponseTime: 250, errors: 23 },
+      { path: "/api/bot/stop", requests24h: 892, successRate: 97, avgResponseTime: 180, errors: 8 },
+      { path: "/api/admin/stats", requests24h: 432, successRate: 99, avgResponseTime: 80, errors: 1 }
+    ]
+  };
+}
+
+// Initialize mock data
+generateMockData();
+
+// Admin Dashboard Endpoint
+router.get('/dashboard', verifyAdminToken, adminLimiter, (req, res) => {
+  const stats = {
+    totalUsers: users.length,
+    activeBots: botDeployments.filter(b => b.status === 'active').length,
+    totalRequests: apiUsageData.totalRequests,
+    totalCommands: botDeployments.reduce((sum, bot) => sum + bot.commandsExecuted, 0),
+    serverNodes: 3, // Assuming 3 server nodes
+    systemStatus: "Operational",
+    uptime: process.uptime(),
+    recentActivity: userActivity.slice(0, 10).sort((a, b) => b.timestamp - a.timestamp),
+    users: users.map(user => ({
+      ...user,
+      password: undefined,
+      salt: undefined
+    })),
+    botDeployments,
+    userActivity: userActivity.sort((a, b) => b.timestamp - a.timestamp),
+    apiUsage: {
+      labels: apiUsageData.labels,
+      data: apiUsageData.data,
+      endpoints: apiUsageData.endpoints
+    }
+  };
+
+  res.json(stats);
+});
+
+// Bot Management Endpoints
+router.post('/bots/:id/stop', verifyAdminToken, adminLimiter, (req, res) => {
+  const bot = botDeployments.find(b => b.id === req.params.id);
+  if (!bot) {
+    return res.status(404).json({ error: "Bot not found" });
+  }
+
+  bot.status = "stopped";
+  bot.lastActive = new Date();
+  
+  userActivity.push({
+    userId: req.userId,
+    username: "Admin",
+    action: "bot_stop",
+    status: "success",
+    timestamp: new Date(),
+    ipAddress: req.ip,
+    details: `Stopped bot ${req.params.id}`
+  });
+
+  res.json({ success: true, message: "Bot stopped successfully" });
+});
+
+router.post('/bots/:id/restart', verifyAdminToken, adminLimiter, (req, res) => {
+  const bot = botDeployments.find(b => b.id === req.params.id);
+  if (!bot) {
+    return res.status(404).json({ error: "Bot not found" });
+  }
+
+  bot.status = "active";
+  bot.lastActive = new Date();
+  
+  userActivity.push({
+    userId: req.userId,
+    username: "Admin",
+    action: "bot_restart",
+    status: "success",
+    timestamp: new Date(),
+    ipAddress: req.ip,
+    details: `Restarted bot ${req.params.id}`
+  });
+
+  res.json({ success: true, message: "Bot restarted successfully" });
+});
+
+// User Management Endpoints
+router.post('/users/:id/ban', verifyAdminToken, adminLimiter, (req, res) => {
+  const user = users.find(u => u.id == req.params.id);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  if (user.role === 'admin') {
+    return res.status(403).json({ error: "Cannot ban admin users" });
+  }
+
+  user.banned = true;
+  
+  userActivity.push({
+    userId: req.userId,
+    username: "Admin",
+    action: "user_ban",
+    status: "success",
+    timestamp: new Date(),
+    ipAddress: req.ip,
+    details: `Banned user ${user.username}`
+  });
+
+  res.json({ success: true, message: "User banned successfully" });
+});
+
+router.post('/users/:id/unban', verifyAdminToken, adminLimiter, (req, res) => {
+  const user = users.find(u => u.id == req.params.id);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  user.banned = false;
+  
+  userActivity.push({
+    userId: req.userId,
+    username: "Admin",
+    action: "user_unban",
+    status: "success",
+    timestamp: new Date(),
+    ipAddress: req.ip,
+    details: `Unbanned user ${user.username}`
+  });
+
+  res.json({ success: true, message: "User unbanned successfully" });
+});
+
+// System Logs Endpoint
+router.get('/logs', verifyAdminToken, adminLimiter, (req, res) => {
+  try {
+    // In production, you'd want to read from actual log files
+    const logs = [
+      { timestamp: new Date(), level: "INFO", message: "System startup completed" },
+      { timestamp: new Date(Date.now() - 10000), level: "DEBUG", message: "Processing bot deployment request" },
+      { timestamp: new Date(Date.now() - 30000), level: "WARN", message: "High CPU usage detected on node 2" }
+    ];
+    
+    res.json(logs);
+  } catch (error) {
+    res.status(500).json({ error: "Error reading logs" });
+  }
+});
+
+// Export bot deployment data
+router.get('/bots/export', verifyAdminToken, adminLimiter, (req, res) => {
+  try {
+    const data = {
+      timestamp: new Date(),
+      botDeployments,
+      generatedBy: `Admin user ${req.userId}`
+    };
+    
+    const filePath = path.join(__dirname, 'exports', `bot-export-${Date.now()}.json`);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    
+    res.download(filePath, () => {
+      // Delete the file after download completes
+      setTimeout(() => fs.unlinkSync(filePath), 5000);
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Error generating export" });
+  }
+});
+
+// API Usage Statistics
+router.get('/api/stats', verifyAdminToken, adminLimiter, (req, res) => {
+  res.json({
+    totalRequests: apiUsageData.totalRequests,
+    endpoints: apiUsageData.endpoints,
+    hourlyUsage: {
+      labels: apiUsageData.labels,
+      data: apiUsageData.data
+    }
+  });
+});
+
+module.exports = router;
