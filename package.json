@@ -54,7 +54,7 @@
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/oblivion-api.git",
+    "url": "git+https://github.com/Shadow2563-sys/Api-s.git",
     "directory": "server"
   },
   "bugs": {
